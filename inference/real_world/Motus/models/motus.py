@@ -92,7 +92,13 @@ class MotusConfig:
 
 
 class VideoModule(nn.Module):
-    """Video processing module - handles WAN + T5 operations."""
+    """视频分支模块，负责 WAN 视频 token 处理与 T5 条件注入。
+
+    约定的核心张量维度:
+        - 视频 latent: `[B, C_latent, T_latent, H_latent, W_latent]`
+        - 视频 token: `[B, L_v, D_wan]`
+        - T5 条件: `[B, L_t5, D_t5]` -> 经过 `text_embedding` 后变成 `[B, L_t5, D_wan]`
+    """
 
     def __init__(self, video_model, dtype, device, grid_sizes):
         super().__init__()
@@ -102,12 +108,21 @@ class VideoModule(nn.Module):
         self.grid_sizes = grid_sizes
 
     def prepare_input(self, noisy_video_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare video tokens from pre-processed noisy latent."""
+        """把 noisy video latent 切 patch 后展平成 WAN token。
+
+        参数:
+            noisy_video_latent: `[B, C_latent, T_latent, H_latent, W_latent]`
+
+        返回:
+            video_features: `[B, L_v, D_wan]`
+                - `L_v = T_patch * H_patch * W_patch`
+                - `D_wan` 通常为 3072
+        """
         # Through patch_embedding: 48 -> 3072 channels
-        video_patched = self.video_model.wan_model.patch_embedding(noisy_video_latent)
+        video_patched = self.video_model.wan_model.patch_embedding(noisy_video_latent)  # [B, D_wan, T_patch, H_patch, W_patch]
 
         # Flatten and convert to tokens
-        video_features = video_patched.flatten(2).transpose(1, 2)
+        video_features = video_patched.flatten(2).transpose(1, 2)  # [B, L_v, D_wan]
 
         # Calculate sequence length and padding
         # seq_lens = torch.tensor([u.size(1) for u in video_tokens_list], dtype=torch.long, device=self.device)
@@ -124,7 +139,15 @@ class VideoModule(nn.Module):
         return video_features
 
     def preprocess_t5_embeddings(self, language_embeddings) -> torch.Tensor:
-        """Pre-process T5 embeddings once for all layers."""
+        """把 T5 文本特征预处理到 WAN 可直接 cross-attn 的空间。
+
+        输入支持两种格式:
+            1. `List[Tensor]`，每个元素 `[L_t5_i, D_t5]`
+            2. `Tensor[B, L_t5, D_t5]`
+
+        返回:
+            t5_context: `[B, L_t5_fixed, D_wan]`
+        """
         # Handle both old format (List[torch.Tensor]) and new format (torch.Tensor)
         if isinstance(language_embeddings, list):
             # Old format: List[torch.Tensor] - do padding
@@ -132,49 +155,75 @@ class VideoModule(nn.Module):
             padded_embeddings = []
 
             for emb in language_embeddings:
+                # emb: [L_t5_i, D_t5]
                 if emb.shape[0] <= text_len:
                     padded = torch.cat([emb, emb.new_zeros(text_len - emb.shape[0], emb.shape[1])])
                 else:
                     padded = emb[:text_len]
                 padded_embeddings.append(padded)
 
-            t5_context_raw = torch.stack(padded_embeddings, dim=0)
+            t5_context_raw = torch.stack(padded_embeddings, dim=0)  # [B, 512, D_t5]
         else:
             # New format: torch.Tensor [B, seq_len, dim] - already padded by collate_fn
-            t5_context_raw = language_embeddings
-        
+            t5_context_raw = language_embeddings  # [B, L_t5, D_t5]
+
         # Convert via text_embedding layer (4096 -> 3072)
-        t5_context = self.video_model.wan_model.text_embedding(t5_context_raw)
+        t5_context = self.video_model.wan_model.text_embedding(t5_context_raw)  # [B, L_t5_fixed, D_wan]
 
         return t5_context
 
     def get_time_embedding(self, t_video: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get WAN's time embedding using WAN's own weights."""
+        """生成 WAN 视频分支的时间嵌入与 AdaLN 参数。
+
+        参数:
+            t_video: `[B]` 或 `[B, L_v]`
+            seq_len: `L_v`
+
+        返回:
+            t_emb: `[B, L_v, D_wan]`
+            t_emb_proj: `[B, L_v, 6, D_wan]`
+                6 份参数分别供 self-attn / FFN 的 AdaLN 调制使用。
+        """
         if t_video.dim() == 1:
             t_video = t_video.unsqueeze(1).expand(t_video.size(0), seq_len)
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
             bt = t_video.size(0)
-            t_flat = t_video.flatten()
+            t_flat = t_video.flatten()  # [B * L_v]
             
             t_emb = self.video_model.wan_model.time_embedding(
                 sinusoidal_embedding_1d(self.video_model.wan_model.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float()
-            )
-            t_emb_proj = self.video_model.wan_model.time_projection(t_emb).unflatten(2, (6, 3072))
+            )  # [B, L_v, D_wan]
+            t_emb_proj = self.video_model.wan_model.time_projection(t_emb).unflatten(2, (6, 3072))  # [B, L_v, 6, D_wan]
             assert t_emb.dtype == torch.float32 and t_emb_proj.dtype == torch.float32
             
         return t_emb, t_emb_proj
 
     def process_cross_attention(self, video_tokens: torch.Tensor, video_adaln_params: torch.Tensor, 
                                layer_idx: int, processed_t5_context: torch.Tensor) -> torch.Tensor:
-        """Process WAN cross attention with pre-processed T5 context."""
+        """执行 WAN 与 T5 文本条件之间的 cross-attention。
+
+        参数维度:
+            - `video_tokens`: `[B, L_v, D_wan]`
+            - `processed_t5_context`: `[B, L_t5, D_wan]`
+
+        返回:
+            - 更新后的 `video_tokens`: `[B, L_v, D_wan]`
+        """
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
         context_lens = None  # WAN uses None for fixed-length context
         cross_out = wan_layer.cross_attn(wan_layer.norm3(video_tokens), processed_t5_context, context_lens)
         return video_tokens + cross_out
     
     def compute_adaln_modulation(self, video_adaln_params: torch.Tensor, layer_idx: int) -> tuple:
-        """Compute AdaLN modulation parameters for WAN (6 components)."""
+        """把预投影后的时间嵌入拆成 6 组 AdaLN 调制参数。
+
+        参数:
+            video_adaln_params: `[B, L_v, 6, D_wan]`
+
+        返回:
+            长度为 6 的 tuple，每个元素形状都是 `[B, L_v, 1, D_wan]`
+        """
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
         with torch.amp.autocast('cuda', dtype=torch.float32):
             modulation = (
@@ -184,24 +233,37 @@ class VideoModule(nn.Module):
         return modulation
 
     def process_ffn(self, video_tokens: torch.Tensor, video_adaln_modulation: tuple, layer_idx: int) -> torch.Tensor:
-        """Process WAN FFN with proper AdaLN modulation."""
+        """执行 WAN 分支本层 FFN。
+
+        参数维度:
+            - `video_tokens`: `[B, L_v, D_wan]`
+            - `video_adaln_modulation[i]`: `[B, L_v, 1, D_wan]`
+        """
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
         
         # AdaLN params
         v_mod = video_adaln_modulation
 
         # WAN FFN with AdaLN (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)
-        ffn_out = wan_layer.ffn(ffn_input)
+        ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)  # [B, L_v, D_wan]
+        ffn_out = wan_layer.ffn(ffn_input)  # [B, L_v, D_wan]
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
             return video_tokens + ffn_out * v_mod[5].squeeze(2)
 
     def apply_output_head(self, video_tokens: torch.Tensor, video_time_emb: torch.Tensor) -> torch.Tensor:
-        """Apply WAN's head + unpatchify for final video output."""
-        x = self.video_model.wan_model.head(video_tokens, video_time_emb)
-        x = self.video_model.wan_model.unpatchify(x, self.grid_sizes)
-        return torch.stack([u.float() for u in x], dim=0)
+        """把 WAN token 还原成视频 latent 速度场。
+
+        参数:
+            - `video_tokens`: `[B, L_v, D_wan]`
+            - `video_time_emb`: `[B, L_v, D_wan]`
+
+        返回:
+            - `video_velocity`: `[B, C_latent, T_latent, H_latent, W_latent]`
+        """
+        x = self.video_model.wan_model.head(video_tokens, video_time_emb)  # [B, L_v, patch_dim]
+        x = self.video_model.wan_model.unpatchify(x, self.grid_sizes)  # List[[C_latent, T_latent, H_latent, W_latent]]
+        return torch.stack([u.float() for u in x], dim=0)  # [B, C_latent, T_latent, H_latent, W_latent]
 
     def process_joint_attention(
         self,
@@ -214,7 +276,18 @@ class VideoModule(nn.Module):
         und_tokens: torch.Tensor,
         und_block: nn.Module,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
+        """三模态联合 self-attention：视频 token + 动作 token + 理解 token。
+
+        输入维度:
+            - `video_tokens`: `[B, L_v, D_wan]`
+            - `action_tokens`: `[B, L_a, D_action]`
+            - `und_tokens`: `[B, L_u, D_und]`
+
+        输出维度:
+            - `video_tokens`: `[B, L_v, D_wan]`
+            - `action_tokens`: `[B, L_a, D_action]`
+            - `und_tokens`: `[B, L_u, D_und]`
+        """
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
 
         # AdaLN params (already computed)
@@ -222,35 +295,36 @@ class VideoModule(nn.Module):
         a_mod = action_adaln_modulation
 
         # Pre-attn normalization with AdaLN
-        norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)
-        norm_action = action_block.norm1(action_tokens) * (1 + a_mod[1].squeeze(2)) + a_mod[0].squeeze(2)
+        norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)  # [B, L_v, D_wan]
+        norm_action = action_block.norm1(action_tokens) * (1 + a_mod[1].squeeze(2)) + a_mod[0].squeeze(2)  # [B, L_a, D_action]
 
         # Get dimensions
-        B, L_v, C = norm_video.shape
-        L_a = norm_action.shape[1]
+        B, L_v, C = norm_video.shape  # C=D_wan
+        L_a = norm_action.shape[1]    # 动作 token 数
         n = self.video_model.wan_model.num_heads
-        d = C // n
+        d = C // n                    # 每个 head 的维度
 
         # Action heads for WAN space (1024 -> 24*128)
-        a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)
+        # WAN的动作头权重是固定的，直接用 action_block 的线性层权重来投影动作 token 到 WAN 的 QKV 空间
+        a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)  # [3, B, L_a, n, d]
         a_q_h, a_k_h, a_v_h = a_qkv[0], a_qkv[1], a_qkv[2]
         a_q = action_block.wan_action_norm_q(a_q_h.flatten(-2)).view(B, L_a, n, d)
         a_k = action_block.wan_action_norm_k(a_k_h.flatten(-2)).view(B, L_a, n, d)
         a_v = a_v_h.view(B, L_a, n, d)
 
         # Understanding Expert processing
-        norm_und = und_block.norm1(und_tokens)
+        norm_und = und_block.norm1(und_tokens)  # [B, L_u, D_und]
         L_u = norm_und.shape[1]
         
         # Understanding Expert heads for WAN space (2048 -> 24*128)
-        u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
+        u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)  # [3, B, L_u, n, d]
         u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
         u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
         u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
         u_v = u_v_h.view(B, L_u, n, d)
 
         # Meta info for WAN attention
-        seq_lens = torch.full((B,), L_v + L_a + L_u, dtype=torch.long, device=self.device)
+        seq_lens = torch.full((B,), L_v + L_a + L_u, dtype=torch.long, device=self.device)  # [B]
         freqs = self.video_model.wan_model.freqs
         if freqs.device != self.device:
             freqs = freqs.to(self.device)
@@ -263,10 +337,10 @@ class VideoModule(nn.Module):
         )
         
         # Project Understanding Expert output
-        und_out = und_block.wan_und_o(und_out_h.flatten(2))
+        und_out = und_block.wan_und_o(und_out_h.flatten(2))  # [B, L_u, D_und]
 
         # Project back and residual connections
-        action_out = action_block.wan_action_o(action_out_h.flatten(2))
+        action_out = action_block.wan_action_o(action_out_h.flatten(2))  # [B, L_a, D_action]
         video_tokens = video_tokens + y * v_mod[2].squeeze(2)
         action_tokens = action_tokens + action_out * a_mod[2].squeeze(2)
         und_tokens = und_tokens + und_out  # Regular residual connection
@@ -275,7 +349,12 @@ class VideoModule(nn.Module):
 
 
 class UndModule(nn.Module):
-    """Understanding module - handles VLM with understanding queries and Understanding Expert."""
+    """理解分支模块，负责把 Qwen3-VL 的输出转成 UndExpert 可消费的 token。
+
+    核心维度约定:
+        - VLM 最后一层隐藏状态: `[B, L_text+L_img, D_vlm]`
+        - 适配后理解 token: `[B, L_u, D_und]`
+    """
 
     def __init__(self, vlm_model, und_expert, config, dtype, device):
         super().__init__()
@@ -293,7 +372,17 @@ class UndModule(nn.Module):
         self,
         vlm_inputs
     ) -> torch.Tensor:
-        """Extract understanding features from VLM last layer."""
+        """从 VLM 最后一层提取理解特征。
+
+        参数:
+            vlm_inputs:
+                - 旧格式: `List[Dict]`
+                - 新格式: `Dict[str, Tensor]`
+
+        返回:
+            adapted_features: `[B, L_u, D_und]`
+                其中 `L_u` 实际上就是 VLM 的总序列长度。
+        """
         if isinstance(vlm_inputs, list):
             B = len(vlm_inputs)
         else:
@@ -301,6 +390,10 @@ class UndModule(nn.Module):
 
         # Returns: inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids
         inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids = self._process_vlm_inputs_to_tokens(vlm_inputs, B)
+        # inputs_embeds: [B, L_u, D_vlm]
+        # attention_mask: [B, L_u]
+        # visual_pos_masks: [B, L_u]
+        # position_ids: [3, B, L_u]
 
         # Forward through VLM with proper attention_mask and DeepStack features
         vlm_kwargs = {
@@ -324,10 +417,11 @@ class UndModule(nn.Module):
             vlm_output = self.vlm_model.model.language_model(**vlm_kwargs)
 
         # Extract last layer features directly
-        last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, vlm_dim]
+        last_layer_features = vlm_output.hidden_states[-1]  # [B, L_u, D_vlm]
 
         # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
-        adapted_features = self.und_expert.vlm_adapter(last_layer_features)
+        # VLM适配器投影到理解专家维度，供后续理解专家处理
+        adapted_features = self.und_expert.vlm_adapter(last_layer_features)  # [B, L_u, D_und]
 
         return adapted_features
         
@@ -335,7 +429,12 @@ class UndModule(nn.Module):
         """Convert VLM inputs to tokens.
 
         Returns:
-            Tuple of (inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids)
+            Tuple of:
+                - `inputs_embeds`: `[B, L_u, D_vlm]`
+                - `attention_mask`: `[B, L_u]`
+                - `visual_pos_masks`: `[B, L_u]`
+                - `deepstack_image_embeds`: DeepStack 视觉特征列表
+                - `position_ids`: `[3, B, L_u]`
         """
         # Handle both old format (List[Dict]) and new format (Dict[str, Tensor])
         if isinstance(vlm_inputs, list):
@@ -366,24 +465,24 @@ class UndModule(nn.Module):
                 padded_attention_masks.append(padded_mask)
 
             # Batch process
-            input_ids_batch = torch.cat(padded_input_ids, dim=0).to(self.device)
-            attention_mask_batch = torch.cat(padded_attention_masks, dim=0).to(self.device)
-            pixel_values_batch = torch.cat([pv.to(self.device) for pv in pixel_values_list], dim=0)
-            image_grid_thw_batch = torch.cat([igt.to(self.device) for igt in image_grid_thw_list], dim=0)
+            input_ids_batch = torch.cat(padded_input_ids, dim=0).to(self.device)  # [B, L_u]
+            attention_mask_batch = torch.cat(padded_attention_masks, dim=0).to(self.device)  # [B, L_u]
+            pixel_values_batch = torch.cat([pv.to(self.device) for pv in pixel_values_list], dim=0)  # batch 后的视觉输入
+            image_grid_thw_batch = torch.cat([igt.to(self.device) for igt in image_grid_thw_list], dim=0)  # [B, 3]
         else:
             # New format: Dict[str, Tensor] - already batched and padded by collate_fn
-            input_ids_batch = vlm_inputs['input_ids'].to(self.device)
-            attention_mask_batch = vlm_inputs['attention_mask'].to(self.device)
+            input_ids_batch = vlm_inputs['input_ids'].to(self.device)  # [B, L_u]
+            attention_mask_batch = vlm_inputs['attention_mask'].to(self.device)  # [B, L_u]
             pixel_values_batch = vlm_inputs['pixel_values'].to(self.device)
-            image_grid_thw_batch = vlm_inputs['image_grid_thw'].to(self.device)
+            image_grid_thw_batch = vlm_inputs['image_grid_thw'].to(self.device)  # [B, 3]
 
         # Get input embeddings
-        inputs_embeds = self.vlm_model.get_input_embeddings()(input_ids_batch)
+        inputs_embeds = self.vlm_model.get_input_embeddings()(input_ids_batch)  # [B, L_u, D_vlm]
 
         # Process images - handle different return formats between Qwen2.5-VL and Qwen3-VL
         image_embeds, deepstack_image_embeds = self.vlm_model.get_image_features(pixel_values_batch, image_grid_thw_batch)
 
-        image_embeds = torch.cat(image_embeds, dim=0).to(self.device, self.dtype)
+        image_embeds = torch.cat(image_embeds, dim=0).to(self.device, self.dtype)  # [N_img_tokens_total, D_vlm]
 
         # Insert image embeddings
         image_mask, _ = self.vlm_model.model.get_placeholder_mask(
@@ -391,7 +490,7 @@ class UndModule(nn.Module):
         )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        visual_pos_masks = image_mask[..., 0]  # [B, seq_len] - visual positions only
+        visual_pos_masks = image_mask[..., 0]  # [B, L_u]，仅图像 token 位置为 True
 
         # Compute position_ids (position_ids remains as original: [3, B, seq_len])
         # Qwen3-VL get_rope_index has different signature: (input_ids, image_grid_thw, video_grid_thw, attention_mask)
@@ -405,12 +504,18 @@ class UndModule(nn.Module):
         return inputs_embeds, attention_mask_batch, visual_pos_masks, deepstack_image_embeds, position_ids
     
     def process_ffn(self, und_tokens: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        """Process Understanding Expert FFN with regular LayerNorm."""
+        """执行理解分支当前层 FFN。
+
+        参数:
+            und_tokens: `[B, L_u, D_und]`
+        返回:
+            `[B, L_u, D_und]`
+        """
         block = self.und_expert.blocks[layer_idx]
         
         # Pre-norm for FFN (regular LayerNorm)
-        ffn_input = block.norm2(und_tokens)
-        ffn_output = block.ffn(ffn_input)
+        ffn_input = block.norm2(und_tokens)   # [B, L_u, D_und]
+        ffn_output = block.ffn(ffn_input)     # [B, L_u, D_und]
         
         # FFN residual connection
         und_tokens = und_tokens + ffn_output
@@ -419,7 +524,12 @@ class UndModule(nn.Module):
 
 
 class ActionModule(nn.Module):
-    """Action processing module - handles Action Expert + joint attentions + masks."""
+    """动作分支模块，负责 ActionExpert 的时间嵌入、AdaLN 和 FFN。
+
+    约定:
+        - 动作 latent / 目标动作: `[B, L_a, D_action_raw]`
+        - 动作 token: `[B, L_a(+state/+registers), D_action_hidden]`
+    """
     
     def __init__(self, action_expert: ActionExpert, config, video_model, vlm_model, dtype, device):
         super().__init__()
@@ -431,13 +541,22 @@ class ActionModule(nn.Module):
         self.device = device
     
     def get_time_embedding(self, t: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get action time embedding."""
+        """生成动作分支时间嵌入。
+
+        参数:
+            t: `[B]` 或 `[B, L_a]`
+            seq_len: 动作 token 长度 `L_a`
+
+        返回:
+            - `a_e`: `[B, L_a, D_action_hidden]`
+            - `a_e0`: `[B, L_a, 6, D_action_hidden]`
+        """
         if t.dim() == 1:
             t = t.unsqueeze(1).expand(t.size(0), seq_len)
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
             bt = t.size(0)
-            t_flat = t.flatten()
+            t_flat = t.flatten()  # [B * L_a]
             
             # Create sinusoidal embedding (same pattern as VideoModule)
             a_e = self.action_expert.time_embedding(
@@ -445,14 +564,18 @@ class ActionModule(nn.Module):
             )  # [B, seq_len, freq_dim]
             
             # Project to AdaLN parameters (6 params: 3 for WAN-Action joint attn + 3 for FFN)
-            a_e0 = self.action_expert.time_projection(a_e).unflatten(2, (6, self.config.action_expert_dim))  # [B, seq_len, 6, dim]
+            a_e0 = self.action_expert.time_projection(a_e).unflatten(2, (6, self.config.action_expert_dim))  # [B, L_a, 6, D_action_hidden]
             
             assert a_e.dtype == torch.float32 and a_e0.dtype == torch.float32
 
         return a_e, a_e0  # (basic_emb, adaln_params)
 
     def compute_adaln_modulation(self, action_adaln_params: torch.Tensor, layer_idx: int) -> tuple:
-        """Compute AdaLN modulation parameters for 6 components (3 for WAN-Action joint attn + 3 for FFN)."""
+        """把动作分支的时间投影拆成 6 组 AdaLN 参数。
+
+        参数:
+            action_adaln_params: `[B, L_a, 6, D_action_hidden]`
+        """
         action_layer = self.action_expert.blocks[layer_idx]
         with torch.amp.autocast('cuda', dtype=torch.float32):
             modulation = (
@@ -462,15 +585,20 @@ class ActionModule(nn.Module):
         return modulation
 
     def process_ffn(self, action_tokens: torch.Tensor, action_adaln_modulation: tuple, layer_idx: int) -> torch.Tensor:
-        """Process Action Expert FFN with AdaLN modulation."""
+        """执行动作分支当前层 FFN。
+
+        参数:
+            - `action_tokens`: `[B, L_a, D_action_hidden]`
+            - `action_adaln_modulation[i]`: `[B, L_a, 1, D_action_hidden]`
+        """
         action_block = self.action_expert.blocks[layer_idx]
 
         # AdaLN params
         a_mod = action_adaln_modulation
 
         # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)
-        ffn_out = action_block.ffn(ffn_input)
+        ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)  # [B, L_a, D_action_hidden]
+        ffn_out = action_block.ffn(ffn_input)  # [B, L_a, D_action_hidden]
         
         with torch.amp.autocast('cuda', dtype=torch.float32):
             action_tokens = action_tokens + ffn_out * a_mod[5].squeeze(2)
@@ -760,45 +888,45 @@ class Motus(nn.Module):
         Returns:
             Dictionary containing losses and metrics
         """
-        B = video_frames.shape[0]
+        B = video_frames.shape[0]  # batch size
 
         # 1. Video pipeline
         # Normalize/format
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)  # [B, C, 1, H, W]
-        video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)  # [B, C, num_frames, H, W]
-        full_video = torch.cat([first_frame_norm, video_normalized], dim=2)  # [B, C, frames+1, H, W]
+        video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)  # [B, C, T_video, H, W]
+        full_video = torch.cat([first_frame_norm, video_normalized], dim=2)  # [B, C, 1+T_video, H, W]
 
         # Encode video using VAE
         with torch.no_grad():
-            clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))  # [B, 48, latent_frames, H', W']
-            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))  # [B, 48, 1, H', W']
+            clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))  # [B, C_latent, T_latent, H_latent, W_latent]
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))  # [B, C_latent, 1, H_latent, W_latent]
 
         # Flow-Matching noise mixture
-        timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))
+        timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))  # [B]
         # Scalar timesteps (0..num_train_timesteps) for time embedding
         video_t_embed = self.fm_train_scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)  # [B]
         # Sigma for noise mixture
-        sigma = self.fm_train_scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device).view(B, 1, 1, 1, 1)
-        video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)
-        noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma
+        sigma = self.fm_train_scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device).view(B, 1, 1, 1, 1)  # [B,1,1,1,1]
+        video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)  # [B, C_latent, T_latent, H_latent, W_latent]
+        noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma  # [B, C_latent, T_latent, H_latent, W_latent]
         # Teacher Forcing on the first frame
         noisy_video_latent[:, :, 0:1] = condition_frame_latent
         # Flow-Matching target: noise - clean
-        video_target = video_noise - clean_full_latent
+        video_target = video_noise - clean_full_latent  # [B, C_latent, T_latent, H_latent, W_latent]
         video_target[:, :, 0:1] = 0
 
         # Latent to Tokens
-        video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))
+        video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))  # [B, L_v, D_wan]
 
         # 2. Action pipeline 
-        timestep_id_action = torch.randint(0, self.fm_train_scheduler_action.num_train_timesteps, (B,))
+        timestep_id_action = torch.randint(0, self.fm_train_scheduler_action.num_train_timesteps, (B,))  # [B]
         # Discrete timesteps for time embedding (0..num_train_timesteps)
         action_t_embed = self.fm_train_scheduler_action.timesteps[timestep_id_action].to(dtype=self.dtype, device=self.device)  # [B]
         # Sigma for action noise mixture
-        sigma_action = self.fm_train_scheduler_action.sigmas[timestep_id_action].to(dtype=self.dtype, device=self.device).view(B, 1, 1)
-        action_noise = torch.randn_like(actions, dtype=self.dtype)
-        noisy_actions = actions * (1 - sigma_action) + action_noise * sigma_action
-        action_target = action_noise - actions
+        sigma_action = self.fm_train_scheduler_action.sigmas[timestep_id_action].to(dtype=self.dtype, device=self.device).view(B, 1, 1)  # [B,1,1]
+        action_noise = torch.randn_like(actions, dtype=self.dtype)  # [B, L_a, D_action_raw]
+        noisy_actions = actions * (1 - sigma_action) + action_noise * sigma_action  # [B, L_a, D_action_raw]
+        action_target = action_noise - actions  # [B, L_a, D_action_raw]
 
         # Encode Action Chunk with optional Registers
         if self.action_expert.config.num_registers > 0 and self.action_expert.registers is not None:
@@ -806,10 +934,10 @@ class Motus(nn.Module):
         else:
             registers = None
         if self.config.training_mode == 'pretrain':
-            action_tokens = self.action_expert.input_encoder(None, noisy_actions, registers)
+            action_tokens = self.action_expert.input_encoder(None, noisy_actions, registers)  # [B, L_a(+reg), D_action_hidden]
         else:
-            state_tokens = state.unsqueeze(1).to(self.dtype)
-            action_tokens = self.action_expert.input_encoder(state_tokens, noisy_actions, registers)
+            state_tokens = state.unsqueeze(1).to(self.dtype)  # [B, 1, state_dim]
+            action_tokens = self.action_expert.input_encoder(state_tokens, noisy_actions, registers)  # [B, 1+L_a(+reg), D_action_hidden]
 
         und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, seq_len, und_dim]
 
@@ -846,17 +974,17 @@ class Motus(nn.Module):
                 
         
             # 4. Heads + Losses
-            video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
-            action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
+            video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)  # [B, C_latent, T_latent, H_latent, W_latent]
+            action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)  # [B, L_decoded, D_action_raw]
             up_len = action_pred_full.shape[1] - self.action_expert.config.num_registers
             # Slice predicted actions depending on mode
             if self.config.training_mode == 'pretrain':
-                action_pred = action_pred_full[:, :up_len, :]
+                action_pred = action_pred_full[:, :up_len, :]  # [B, L_a, D_action_raw]
             else:
-                action_pred = action_pred_full[:, 1:up_len, :]
+                action_pred = action_pred_full[:, 1:up_len, :]  # [B, L_a, D_action_raw]
 
             # Video loss (mask the first frame)
-            video_pred_masked = video_pred.clone()
+            video_pred_masked = video_pred.clone()  # [B, C_latent, T_latent, H_latent, W_latent]
             video_pred_masked[:, :, 0:1] = 0
             video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
         
@@ -899,52 +1027,70 @@ class Motus(nn.Module):
         Returns:
             Tuple of (predicted_frames, predicted_actions)
         """
-        B = first_frame.shape[0]
+        B = first_frame.shape[0]  # batch size，真实世界示例通常为 1
 
-        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
-        state = state.to(self.device).to(self.dtype)
-        first_frame = first_frame.to(self.device).to(self.dtype)
+        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]  # List[[L_t5_i, D_t5]]
+        state = state.to(self.device).to(self.dtype)          # [B, state_dim]
+        first_frame = first_frame.to(self.device).to(self.dtype)  # [B, 3, H, W]
 
         # 1. Video/Action latents init
         # Condition frame encode
-        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [0,1] -> [-1,1], [B, C, 1, H, W]
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [0,1] -> [-1,1], [B, C, H, W] ---> [B, C, T=1, H, W]
         with torch.no_grad():
-            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [B, C', 1, H', W']
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [B, C_latent, 1, H_latent, W_latent]
 
         # Init video/action latents
         B, C_latent, f_latent, H_latent, W_latent = condition_frame_latent.shape
+        # C_latent: VAE latent 通道数
+        # f_latent: 条件帧 latent 帧数，单帧条件下通常为 1
+        # H_latent / W_latent: latent 空间分辨率
+        # 这里的 `// 4` 来自 WAN VAE 的时间压缩倍率：
+        # - 在 `bak/wan/configs/wan_ti2v_5B.py` 里可见 `vae_stride = (4, 16, 16)`
+        #   其中第 1 个维度 4 表示“时间维压缩 4 倍”
+        # - 在 `bak/wan/textimage2video.py` 里，官方计算 latent 时间长度的公式是
+        #   `(F - 1) // self.vae_stride[0] + 1`
+        #   即像素空间视频帧数 `F` 会按 `vae_stride[0]` 映射到 latent 帧数
+        # 所以这里:
+        # - `1` 表示条件首帧的 latent
+        # - `self.config.num_video_frames // 4` 表示未来 `num_video_frames`
+        #   在 latent 空间里对应的帧数
         num_total_latent_frames = 1 + self.config.num_video_frames // 4
-        video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
-        video_latent[:, :, 0:1] = condition_frame_latent
-        action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
-        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
+        video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)  # [B, C_latent, T_latent, H_latent, W_latent]
+        video_latent[:, :, 0:1] = condition_frame_latent # 将latent空间的第一帧初始化为条件帧的latent
+        action_shape = (B, self.config.action_chunk_size, self.config.action_dim)  # [B, L_a, D_action_raw]
+        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)  # [B, L_a, D_action_raw]
 
         # 2. Understanding Expert features and T5 context
         # Extract understanding features from VLM
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, L_u, D_und]
 
         # T5 preprocess
-        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)  # [B, L_t5_fixed, D_wan]
 
         # 3. Denoising loop: from noise (t=1) to clean (t=0)
-        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+        # 从噪声（t=1）到干净（t=0）的时间序列
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)  # [num_inference_steps+1]
         for i in range(num_inference_steps):
             # Timesteps
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t
-            video_t_scaled = (t * 1000).expand(B).to(self.dtype)
-            action_t_scaled = (t * 1000).expand(B).to(self.dtype)
+            t = timesteps[i]           # 当前时刻，标量
+            t_next = timesteps[i + 1]  # 下一时刻，标量
+            dt = t_next - t            # Euler 步长，标量
+            video_t_scaled = (t * 1000).expand(B).to(self.dtype)   # [B]
+            action_t_scaled = (t * 1000).expand(B).to(self.dtype)  # [B]
 
             # Tokens with Registers
-            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
-            state_tokens = state.unsqueeze(1).to(self.dtype)
+            # 将视频的潜变量转换为WAN模型的token
+            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))  # [B, L_v, D_wan]
+
+            # 将状态和动作潜变量转换为action expert的token
+            state_tokens = state.unsqueeze(1).to(self.dtype)  # [B, 1, state_dim]
+
             # Expand registers for batch
             registers = self.action_expert.registers.expand(B, -1, -1)  # [B, num_registers, dim]
-            action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
+            action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)  # [B, 1+L_a+num_registers, D_action_hidden]
 
             # Note: Understanding tokens already extracted before the loop, will be updated in joint attention
-            und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, num_queries * num_layers, und_dim]
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, L_u, D_und]
 
             
             # Trimodal MoT forward - joint denoising for WAN, Action, Understanding
@@ -960,6 +1106,7 @@ class Motus(nn.Module):
                     action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
                     
                     # Trimodal joint attention: WAN + Action + Understanding
+                    # MoT核心：WAN，Action，Understanding三模态在每层的联合注意力机制
                     video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
                         video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
                         self.action_expert.blocks[layer_idx],
@@ -977,27 +1124,27 @@ class Motus(nn.Module):
                     und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
 
                 # Heads (velocities)
-                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)  # [B, C_latent, T_latent, H_latent, W_latent]
                 # Use decoder with all tokens (including registers)
-                action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
+                action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)  # [B, 1+L_a+num_registers, D_action_raw]
                 # Extract middle action chunk (skip first state token and last register tokens)
-                action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]
+                action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]  # [B, L_a, D_action_raw]
 
                 # Euler integration
-                video_latent = video_latent + video_velocity * dt
-                action_latent = action_latent + action_velocity * dt
+                video_latent = video_latent + video_velocity * dt    # [B, C_latent, T_latent, H_latent, W_latent]
+                action_latent = action_latent + action_velocity * dt # [B, L_a, D_action_raw]
 
                 # Teacher Forcing
                 video_latent[:, :, 0:1] = condition_frame_latent
 
         # 4. Decode outputs
         with torch.no_grad():
-            decoded_frames = self.video_model.decode_video(video_latent)
-            predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
-            predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
-            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
+            decoded_frames = self.video_model.decode_video(video_latent)  # 通常为 [B, 3, 1+T_video, H, W]
+            predicted_frames = decoded_frames[:, :, 1:]  # [B, 3, T_video, H, W]，去掉条件帧
+            predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] -> [0,1]
+            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()  # [B, 3, T_video, H, W]
         
-        predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
+        predicted_actions = action_latent.float()  # [B, action_chunk_size, action_dim]
 
         return predicted_frames, predicted_actions
 
