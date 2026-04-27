@@ -244,7 +244,7 @@ class VideoModule(nn.Module):
         # AdaLN params
         v_mod = video_adaln_modulation
 
-        # WAN FFN with AdaLN (params 3,4,5 for FFN: α3, β3, γ3)
+        # WAN FFN with AdaLN (params 3,4,5 for FFN: shift, scale, gate)
         ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)  # [B, L_v, D_wan]
         ffn_out = wan_layer.ffn(ffn_input)  # [B, L_v, D_wan]
 
@@ -596,7 +596,7 @@ class ActionModule(nn.Module):
         # AdaLN params
         a_mod = action_adaln_modulation
 
-        # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: α3, β3, γ3)
+        # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: shift, scale, gate)
         ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)  # [B, L_a, D_action_hidden]
         ffn_out = action_block.ffn(ffn_input)  # [B, L_a, D_action_hidden]
         
@@ -1017,7 +1017,7 @@ class Motus(nn.Module):
         Joint inference for video and action prediction.
         
         Args:
-            first_frame: Initial frame [B, C, H, W]
+            first_frame: Initial frame `[B, C=3, H, W]`, value range `[0,1]`
             texts: Text instructions for VLM
             images: Optional images for VLM
             state: Initial robot state [B, state_dim]
@@ -1355,7 +1355,7 @@ class Motus(nn.Module):
         Joint inference for video and action prediction.
         
         Args:
-            first_frame: Initial frame [B, C, H, W]
+            first_frame: Initial frame `[B, C=3, H, W]`, value range `[0,1]`
             texts: Text instructions for VLM
             images: Optional images for VLM
             state: Initial robot state [B, state_dim]
@@ -1462,7 +1462,7 @@ class Motus(nn.Module):
             predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
             predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
 
-        predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
+        predicted_actions = action_latent.float()  # [B, action_chunk_size, action_dim]
 
         return predicted_frames, predicted_actions
     '''

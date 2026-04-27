@@ -470,6 +470,15 @@ def umt5_xxl(**kwargs):
 
 
 class T5EncoderModel:
+    """WAN 使用的 UMT5 文本编码器封装。
+
+    推理输入/输出维度:
+    - `texts`: Python list，长度为 `B`
+    - tokenizer 输出 `ids [B, text_len]`、`mask [B, text_len]`
+    - encoder 输出 `context [B, text_len, D_t5]`
+    - 返回值为 `List[Tensor[L_i, D_t5]]`，其中 `L_i` 是第 i 条文本的有效 token 数，
+      padding token 会被裁掉。
+    """
 
     def __init__(
         self,
@@ -506,8 +515,8 @@ class T5EncoderModel:
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(
             texts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(device)
-        mask = mask.to(device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask)
-        return [u[:v] for u, v in zip(context, seq_lens)]
+        ids = ids.to(device)    # [B, text_len]
+        mask = mask.to(device)  # [B, text_len], 1 表示有效 token，0 表示 padding
+        seq_lens = mask.gt(0).sum(dim=1).long()  # [B]
+        context = self.model(ids, mask)  # [B, text_len, D_t5]
+        return [u[:v] for u, v in zip(context, seq_lens)]  # each: [L_i, D_t5]

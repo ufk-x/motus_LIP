@@ -135,9 +135,9 @@ def load_image_as_tensor(image_path: str, size_hw: tuple[int, int]) -> torch.Ten
             - 值域: `[0, 1]`
     """
     img = Image.open(image_path).convert("RGB")
-    img = img.resize((size_hw[1], size_hw[0]), Image.BICUBIC)  # (W,H)
-    arr = np.array(img).astype(np.float32) / 255.0  # [H, W, C]
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+    img = img.resize((size_hw[1], size_hw[0]), Image.BICUBIC)  # PIL resize 的参数是 (W, H)，因此这里传入 (size_hw[1], size_hw[0])
+    arr = np.array(img).astype(np.float32) / 255.0  # 归一化到 [0, 1]，shape: (H, W, C)
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
     return tensor
 
 
@@ -162,14 +162,23 @@ def build_vlm_inputs(processor, instruction: str, image: Image.Image, device: to
             ]
         }
     ]
+    # 利用前面读取的chat_template.json，把messages拼成Qwen3-VL期望的输入格式文本，
+    # 注意这里不直接tokenize，而是让processor在后续处理时一起处理文本和图像，以确保它们的对齐和预处理一致。
     text = processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+    # 这里的 `text` 已经是 processor 内部 chat_template 处理后的字符串，包含了特殊的占位符来标记文本和图像的位置，
+    # processor会在后续处理时识别这些占位符并进行相应的tokenize和视觉预处理。
     encoded = processor(text=[text], images=[image], return_tensors='pt')
+    # encoded的input_ids是文本token的ID序列，
+    # attention_mask是对应的注意力掩码，
+    # pixel_values是处理后的视觉输入张量，
+    # image_grid_thw是视觉token对应的网格尺寸信息。
     vlm_inputs = {
-        'input_ids': encoded['input_ids'].to(device),              # [1, L]
-        'attention_mask': encoded['attention_mask'].to(device),    # [1, L]
+        'input_ids': encoded['input_ids'].to(device),              # [B = 1, L_text]
+        'attention_mask': encoded['attention_mask'].to(device),    # [B = 1, L_text]
         'pixel_values': encoded['pixel_values'].to(device),        # Qwen3-VL 视觉输入张量
-        'image_grid_thw': encoded.get('image_grid_thw', None)
+        'image_grid_thw': encoded.get('image_grid_thw', None)      # [B=1, 3（代表T, H, W）] 或 None，取决于processor是否返回这个字段
     }
+    # 单纯只是把image_grid_thw移动到设备上，如果它存在的话；如果processor没有返回这个字段，就保持None。
     if vlm_inputs['image_grid_thw'] is not None:
         vlm_inputs['image_grid_thw'] = vlm_inputs['image_grid_thw'].to(device)  # [1, 3]
     return vlm_inputs
@@ -183,6 +192,8 @@ def save_frame_grid(condition_frame: torch.Tensor, predicted_frames: torch.Tenso
         - `predicted_frames`: `[T, C, H, W]`
           其中 `T=num_video_frames`
     """
+    # cf更换维度是因为PIL Image.fromarray需要(H, W, C)的格式，而模型输出通常是(C, H, W)，所以需要permute来调整维度顺序。
+    # 同时，模型输出的值域是[0, 1]，需要乘以255并转换成uint8格式才能正确保存为图片。
     cf = (condition_frame.detach().cpu().float().clamp(0,1).permute(1,2,0).numpy()*255).astype(np.uint8)
     frames = []
     T = predicted_frames.shape[0]
@@ -190,7 +201,9 @@ def save_frame_grid(condition_frame: torch.Tensor, predicted_frames: torch.Tenso
         f = (predicted_frames[i].detach().cpu().float().clamp(0,1).permute(1,2,0).numpy()*255).astype(np.uint8)
         frames.append(f)
     all_frames = [cf] + frames
+    # 横向拼接所有帧，形成一个大图，方便查看每一帧的变化；如果有8帧预测，那么最终就是9帧（1条件+8预测）横向排列在一起。
     grid = np.concatenate(all_frames, axis=1)
+    # 使用PIL保存图片，路径由save_path指定，格式通常是png或jpg。
     Image.fromarray(grid).save(save_path)
 
 
@@ -274,16 +287,16 @@ def main():
     load_checkpoint_into_model(model, args.ckpt_dir)
 
     # Prepare inputs
-    H, W = cfg['common']['video_height'], cfg['common']['video_width']  # 目标视频尺寸
-    # 将输入图像转换成模型需要的张量格式，并移动到正确的设备上
-    first_frame = load_image_as_tensor(args.image, (H, W)).to(device)  # [1, 3, H, W]
-    state_dim = int(cfg['common']['state_dim'])
-    state = torch.zeros((1, state_dim), dtype=torch.bfloat16, device=device)  # [1, state_dim]
+    H, W = cfg['common']['video_height'], cfg['common']['video_width']  # 目标视频尺寸,H=384, W=320
+    # 将cli输入图像转换成模型需要的归一化张量格式，并移动到正确的设备上
+    first_frame = load_image_as_tensor(args.image, (H, W)).to(device)  # [B=1, C=3, H, W]
+    state_dim = int(cfg['common']['state_dim']) # 14维，state_dim: 14
+    state = torch.zeros((1, state_dim), dtype=torch.bfloat16, device=device)  # [1, state_dim=14]
     # 真实机器人示例里这里通常应换成当前观测到的机器人状态；
     # 本脚本没有环境，因此用全 0 状态占位。
 
     # Build VLM inputs
-    vlm_ckpt = cfg['model']['vlm']['checkpoint_path']
+    vlm_ckpt = cfg['model']['vlm']['checkpoint_path'] # checkpoint_path: "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
     # `vlm_ckpt` 通常指向一个 Hugging Face 风格的 Qwen3-VL 目录，例如:
     #   Qwen3-VL-2B-Instruct/
     #     |- config.json
@@ -321,12 +334,17 @@ def main():
     # - VLM 负责“前向计算”
     # - processor 负责“把原始文本/图像整理成 VLM 能吃的输入”
     # 两者都用同一个目录，但读取的文件类型不同，因此不会互相加载错权重。
+
+    # 加载 Qwen3-VL 的 processor，负责后续把文本指令和图像处理成模型输入格式
     processor = AutoProcessor.from_pretrained(vlm_ckpt, trust_remote_code=True)
 
     # 将输入的图像转成模型所需的张量格式
+    # VLMinput的图像输入通常是PIL Image格式，processor会在内部处理成模型需要的视觉张量，因此这里保持PIL格式即可。
+    # 不像前面的 `load_image_as_tensor` 那样直接转成归一化张量，前面的是给Motus模型的WAN部分使用的，而这里是给VLM使用的，
+    # 是因为 VLM 的 processor 可能会有特定的预处理步骤（例如特定的 resize、normalize、patchify 等），这些最好让 processor 来统一处理，以确保和训练时的预处理完全一致。
     first_frame_pil = Image.open(args.image).convert("RGB").resize((W, H), Image.BICUBIC)
     
-    # 将文本指令和图像一起处理成VLM输入格式，包含input_ids, attention_mask, pixel_values等，并移动到设备上
+    # 将文本指令和图像一起处理成VLM输入格式，返回的vlm_inputs是一个dict,包含input_ids, attention_mask, pixel_values等，并移动到设备上
     vlm_inputs = build_vlm_inputs(processor, args.instruction, first_frame_pil, device)
 
     # Build T5 embeddings
@@ -341,8 +359,8 @@ def main():
             tokenizer_path=t5_tokenizer,
         )
         t5_out = t5([args.instruction], device=str(device))  # 常见返回: [1, L_t5, D_t5]
-        if isinstance(t5_out, torch.Tensor):
-            language_embeddings: List[torch.Tensor] = [t5_out.squeeze(0)]  # 每个元素: [L_t5, D_t5]
+        if isinstance(t5_out, torch.Tensor): # 如果是Tensor，那么shape是[1, L_t5, D_t5]
+            language_embeddings: List[torch.Tensor] = [t5_out.squeeze(0)]  # 我们需要把它变成List[Tensor]的格式，即 [t5_out.squeeze(0)]，每个元素是[L_t5, D_t5]
         else:
             language_embeddings = t5_out
     else: # 如果不使用T5编码指令，则需要提供预编码的T5嵌入文件路径，通过命令行参数传入
@@ -352,9 +370,9 @@ def main():
         # 允许两种格式:
         # 1. 单个 Tensor: [L_t5, D_t5]
         # 2. Tensor 列表: List[[L_t5_i, D_t5]]
-        if isinstance(loaded, torch.Tensor):
+        if isinstance(loaded, torch.Tensor): # 假如加载的就是一个Tensor，那么直接放到列表里，并移动到设备上
             language_embeddings = [loaded.to(device)]
-        elif isinstance(loaded, list):
+        elif isinstance(loaded, list): # 假如加载的是一个列表，那么我们假设它是 List[Tensor] 的格式，需要把每个Tensor都移动到设备上
             language_embeddings = [t.to(device) for t in loaded]
         else:
             raise ValueError("Unsupported t5_embeds format, expected Tensor or List[Tensor]")
@@ -362,22 +380,23 @@ def main():
     # Inference
     with torch.no_grad():
         predicted_frames, predicted_actions = model.inference_step(
-            first_frame=first_frame,  # [1, 3, H, W]
+            first_frame=first_frame,  # [B=1, C=3, H, W]
             state=state,              # [1, state_dim]
-            num_inference_steps=cfg['model']['inference']['num_inference_timesteps'],
+            num_inference_steps=cfg['model']['inference']['num_inference_timesteps'], # num_inference_timesteps: 10
             language_embeddings=language_embeddings,  # List[[L_t5, D_t5]]
             vlm_inputs=[vlm_inputs],                  # List[Dict[str, Tensor]]，batch size=1
         )
     # language_embeddings和vlm_inputs都涉及了args.instruction，但它们分别是给WAN和VLM使用的不同格式的输入：
-    # language_embeddings 是给 WAN 的文本条件
-    # vlm_inputs 是给 VLM 的多模态输入
+    # language_embeddings 是给 WAN 的文本条件，使用了T5编码后的指令嵌入，格式是 List[Tensor]，每个 Tensor 形状通常是 [L_t5, D_t5]，其中 L_t5 是 T5 输出的序列长度，D_t5 是 T5 的隐藏维度。
+    # vlm_inputs 是给 VLM 的多模态输入，是一个字典
 
     # Save frames grid
     # Convert predicted_frames to [T,C,H,W]
-    if predicted_frames.dim() == 5 and predicted_frames.shape[1] != 3:
+    if predicted_frames.dim() == 5 and predicted_frames.shape[1] != 3: # [B,T,C,H,W]：第二维不是 channel，去掉 batch 后就是 [T,C,H,W]。
         frames_vis = predicted_frames.squeeze(0) # [B=1, T, C, H, W] ---> [T, C, H, W]
-    else:
+    else: # 常见模型输出是 [B,C,T,H,W]：交换 channel/time 后变为 [B,T,C,H,W]，再去掉 batch。
         frames_vis = predicted_frames.permute(0, 2, 1, 3, 4).squeeze(0) # [B=1, C, T, H, W] ---> [B=1, T, C, H, W] ---> [T, C, H, W]
+    # 使用PIL把条件帧和预测帧横向拼接保存成图片，路径由args.output指定，便于肉眼检查每一帧的变化；如果有8帧预测，那么最终就是9帧（1条件+8预测）横向排列在一起。
     save_frame_grid(first_frame.squeeze(0), frames_vis, args.output)
     print(f"Saved predicted frames grid to {args.output}")
 

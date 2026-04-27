@@ -36,6 +36,12 @@ class WanVideoModel(nn.Module):
     WAN Video Diffusion Model wrapper for TI2V Teacher Forcing training.
     Provides VAE encoding/decoding and feature extraction for joint video-action training.
     Uses Teacher Forcing approach for I2V conditioning (DiffSynth-Studio style).
+
+    维度约定:
+    - 像素空间视频: `[B, C=3, T, H, W]`，值域通常为 `[-1, 1]`
+    - VAE latent 视频: `[B, C_latent=48, T_latent, H_latent, W_latent]`
+    - WAN patch tokens: `[B, L_video, D_wan]`，其中 `L_video` 由 latent 的时空网格 patchify 后得到
+    - T5 文本条件: `List[Tensor[L_text_i, D_t5]]`，padding 后进入 WAN text embedding
     """
     
     def __init__(
@@ -68,10 +74,10 @@ class WanVideoModel(nn.Module):
         Encode video pixels to latent space.
         
         Args:
-            video_pixels: Video in pixel space [B, C, T, H, W], range [-1, 1]
+            video_pixels: Video in pixel space [B, C=3, T, H, W], range [-1, 1]
             
         Returns:
-            Video latents [B, C', T', H', W']
+            Video latents [B, C_latent=48, T_latent, H_latent, W_latent]
         """
         with torch.no_grad():
             return self.vae.encode(video_pixels)
@@ -81,10 +87,10 @@ class WanVideoModel(nn.Module):
         Decode video latents to pixel space.
         
         Args:
-            video_latents: Video latents [B, C, T, H, W]
+            video_latents: Video latents [B, C_latent=48, T_latent, H_latent, W_latent]
             
         Returns:
-            Video pixels [B, C', T', H', W'], range [-1, 1]
+            Video pixels [B, C=3, T_pixel, H_pixel, W_pixel], range [-1, 1]
         """
         with torch.no_grad():
             video_pixels = []
@@ -105,13 +111,14 @@ class WanVideoModel(nn.Module):
         Extract intermediate layer features for cross-attention injection.
         
         Args:
-            video_latent: Video latent tensors [B, C, T, H, W]
-            timestep: Diffusion timesteps [B]
-            text_embeddings: List of text embeddings
+            video_latent: Video latent tensors [B, C_latent=48, T_latent, H_latent, W_latent]
+            timestep: Diffusion timesteps [B] or [B, L_video]
+            text_embeddings: List of text embeddings, each `[L_text_i, D_t5]`
             layer_indices: Which layers to extract (None = all layers)
             
         Returns:
-            List of feature tensors from specified layers
+            List of feature tensors. Intermediate layers are `[B, L_video, D_wan]`;
+            the final appended prediction is unpatchified `[B, C_latent, T_latent, H_latent, W_latent]`.
         """
         if layer_indices is None:
             layer_indices = list(range(len(self.wan_model.blocks)))
@@ -125,7 +132,7 @@ class WanVideoModel(nn.Module):
         if video_latent.shape[1] != expected_channels:
             raise ValueError(f"Expected {expected_channels} channels for WAN 2.2, got {video_latent.shape[1]} channels")
         
-        # Convert to WAN format (list of tensors)
+        # Convert to WAN format (list of tensors): [B,C,T,H,W] -> B * [C,T,H,W]
         video_list = [video_latent[i] for i in range(video_latent.shape[0])]
         seq_len = video_latent.shape[2] * video_latent.shape[3] * video_latent.shape[4] // 4
         
@@ -135,9 +142,9 @@ class WanVideoModel(nn.Module):
             self.wan_model.freqs = self.wan_model.freqs.to(device)
         
         # Embeddings
-        x = [self.wan_model.patch_embedding(u.unsqueeze(0)) for u in video_list]
+        x = [self.wan_model.patch_embedding(u.unsqueeze(0)) for u in video_list]  # each: [1, D_wan, T_p, H_p, W_p]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long, device=device) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
+        x = [u.flatten(2).transpose(1, 2) for u in x]  # each: [1, L_video_i, D_wan]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) 

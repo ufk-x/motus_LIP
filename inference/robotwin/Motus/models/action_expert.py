@@ -54,7 +54,16 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos):
 
 @dataclass
 class ActionExpertConfig:
-    """Configuration for Action Expert model."""
+    """Action Expert 配置。
+
+    维度约定:
+    - `B`: batch size
+    - `A`: `chunk_size`，一次预测的动作 token 数，通常等于 `num_video_frames * video_action_freq_ratio`
+    - `D_state`: 机器人状态维度，即 `state_dim`
+    - `D_action`: 单步动作维度，即 `action_dim`
+    - `D`: Action Expert hidden size，即 `dim`
+    - `R`: register token 数，即 `num_registers`
+    """
     # Architecture - Updated for UniDiffuser
     dim: int = 1024                   # Hidden dimension (for ~500M params)
     ffn_dim: int = 4096              # FFN dimension (4x hidden dim)
@@ -85,7 +94,15 @@ class ActionExpertConfig:
         assert self.chunk_size >= 2, "chunk_size must be at least 2 (1 state + 1 action)"
 
 class StateActionEncoder(nn.Module):
-    """Encoder for robot states and actions."""
+    """机器人状态和动作的输入编码器。
+
+    推理/finetune 模式使用该编码器，token 顺序固定为:
+    `[state token] + [action tokens] + [register tokens]`。
+    输入维度从物理量空间映射到 Transformer hidden space:
+    - state: `[B, 1, D_state] -> [B, 1, D]`
+    - action: `[B, A, D_action] -> [B, A, D]`
+    - registers: `[B, R, D]`，已经处于 hidden space，只做拼接
+    """
     
     def __init__(self, config: ActionExpertConfig):
         super().__init__()
@@ -104,7 +121,7 @@ class StateActionEncoder(nn.Module):
             out_features=config.dim
         )
         
-        # Create fixed sinusoidal positional embeddings (chunk_size + 1 + num_registers)
+        # Create fixed sinusoidal positional embeddings (chunk_size + 1 state token + num_registers)
         max_seq_len = config.chunk_size + 1 + config.num_registers
         pos_embed = get_1d_sincos_pos_embed_from_grid(
             config.dim, 
@@ -143,8 +160,8 @@ class StateActionEncoder(nn.Module):
             registers: [B, num_registers, dim] - optional register tokens
             
         Returns:
-            Encoded sequence [B, chunk_size + num_registers, dim] if registers provided
-            Encoded sequence [B, chunk_size, dim] if no registers
+            Encoded sequence [B, 1 + action_chunk_size + num_registers, dim] if registers provided
+            Encoded sequence [B, 1 + action_chunk_size, dim] if no registers
         """
         B = state_tokens.shape[0]
         chunk_size = state_tokens.shape[1] + action_tokens.shape[1]
@@ -155,10 +172,10 @@ class StateActionEncoder(nn.Module):
         # Encode action tokens: direct encoding
         action_encoded = self.action_encoder(action_tokens)  # [B, action_chunk_size, dim]
         
-        # Concatenate state and action encodings
+        # Concatenate state and action encodings: [state] + [actions]
         encoded = torch.cat([state_encoded, action_encoded], dim=1)  # [B, chunk_size, dim]
         
-        # Optionally concatenate registers
+        # Optionally concatenate registers at the tail. Decoder output must later drop these tail tokens.
         if registers is not None:
             encoded = torch.cat([encoded, registers], dim=1)  # [B, chunk_size + num_registers, dim]
         
@@ -170,7 +187,11 @@ class StateActionEncoder(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    """Encoder for action-only sequences (no state)."""
+    """仅动作序列编码器，用于 pretrain/action-only 模式。
+
+    token 顺序为 `[action tokens] + [register tokens]`，没有 state token。
+    因此后续 decoder 切片时不能跳过第 0 个 token，只需要移除尾部 register。
+    """
     def __init__(self, config: ActionExpertConfig):
         super().__init__()
         self.config = config
@@ -203,11 +224,21 @@ class ActionEncoder(nn.Module):
         raise ValueError(f'Unknown projector type: {projector_type}')
 
     def forward(self, state_tokens: torch.Tensor, action_tokens: torch.Tensor, registers: torch.Tensor = None) -> torch.Tensor:
+        """将动作 token 编码到 hidden space。
+
+        Args:
+            state_tokens: pretrain 模式不使用，可为 None。
+            action_tokens: `[B, A, D_action]`。
+            registers: 可选 `[B, R, D]`。
+
+        Returns:
+            `[B, A + R, D]` 或 `[B, A, D]`。
+        """
         # state_tokens is ignored for action-only mode
         action_encoded = self.action_encoder(action_tokens)  # [B, chunk_size, dim]
         encoded = action_encoded
         if registers is not None:
-            encoded = torch.cat([encoded, registers], dim=1)
+            encoded = torch.cat([encoded, registers], dim=1)  # [B, A + R, D]
         seq_len = encoded.shape[1]
         encoded = encoded + self.pos_embedding[:, :seq_len, :]
         return encoded
@@ -260,7 +291,11 @@ class ActionExpertBlock(nn.Module):
 
 
 class ActionDecoder(nn.Module):
-    """Final layer to decode action predictions."""
+    """动作输出头。
+
+    输入是 Action Expert 的 hidden tokens，输出回动作空间。注意 decoder 会对所有输入 token
+    产生输出；调用方需要根据 token 排列移除 state token 和 register token。
+    """
     
     def __init__(self, config: ActionExpertConfig):
         super().__init__()
@@ -291,11 +326,11 @@ class ActionDecoder(nn.Module):
         Decode action predictions.
         
         Args:
-            x: Features [B, chunk_size, dim]
-            time_emb: Time embeddings [B, chunk_size, dim] for head modulation
+            x: Features [B, L, dim]，其中 L 可能是 `1 + A + R` 或 `A + R`
+            time_emb: Time embeddings [B, L, dim] for head modulation
             
         Returns:
-            Action predictions [B, chunk_size, action_dim]
+            Action predictions [B, L, action_dim]，尚未裁掉 state/register 对应位置
         """
         # WAN Head-style modulation using time_emb
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -311,6 +346,13 @@ class ActionExpert(nn.Module):
     - causal=False: Full sequence diffusion, all tokens can attend to each other
     - causal=True: Causal attention, state+action tokens can only see past tokens
     - Cross-attention with video features for visual grounding
+
+    推理中的维度流:
+    - `action_latent`: `[B, A, D_action]`
+    - finetune 模式: `state_tokens [B,1,D_state] + action_latent + registers [B,R,D]`
+      编码为 `[B, 1 + A + R, D]`
+    - pretrain 模式: `action_latent + registers` 编码为 `[B, A + R, D]`
+    - decoder 输出仍包含 state/register 对应位置；Motus 根据模式裁剪为 `[B, A, D_action]`
     """
     
     def __init__(self, config: ActionExpertConfig, wan_config: dict = None):

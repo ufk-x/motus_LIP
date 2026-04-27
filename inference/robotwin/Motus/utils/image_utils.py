@@ -23,11 +23,11 @@ def resize_with_padding(frame: np.ndarray, target_size: Tuple[int, int]) -> np.n
     4. Centering the resized image within the padded frame
     
     Args:
-        frame: Input image [H, W, C]
-        target_size: Target size (height, width)
+        frame: Input image `[H_in, W_in, C]`
+        target_size: Target size `(height, width)` = `(H_out, W_out)`
         
     Returns:
-        Processed image [target_height, target_width, C]
+        Processed image `[H_out, W_out, C]`，dtype 与输入保持一致；只改变空间维度，不改变通道数。
         
     Example:
         >>> frame = np.random.randint(0, 255, (720, 640, 3), dtype=np.uint8)
@@ -37,7 +37,8 @@ def resize_with_padding(frame: np.ndarray, target_size: Tuple[int, int]) -> np.n
     target_height, target_width = target_size
     original_height, original_width = frame.shape[:2]
     
-    # Calculate scaling ratio, use the smaller ratio to ensure image fits completely
+    # Calculate scaling ratio, use the smaller ratio to ensure image fits completely.
+    # scale 后的 `[new_height,new_width]` 一定能放进 `[target_height,target_width]`。
     scale_height = target_height / original_height
     scale_width = target_width / original_width
     scale = min(scale_height, scale_width)
@@ -68,11 +69,11 @@ def load_video_frames(video_path: str, frame_indices: List[int], target_size: Tu
     
     Args:
         video_path: Path to video file
-        frame_indices: List of frame indices to load
-        target_size: Optional target size (height, width) for resizing with padding
+        frame_indices: List of frame indices to load, length is `T`
+        target_size: Optional target size `(H,W)` for resizing with padding
         
     Returns:
-        Video tensor [T, C, H, W] in range [0, 1]
+        Video tensor `[T, C=3, H, W]` in range `[0, 1]`
     """
     cap = cv2.VideoCapture(video_path)
     
@@ -101,7 +102,7 @@ def load_video_frames(video_path: str, frame_indices: List[int], target_size: Tu
             
             frames.append(frame)
         
-        # Convert to tensor [T, C, H, W] and normalize to [0, 1]
+        # Convert to tensor: numpy `[T,H,W,C]` -> torch `[T,C,H,W]`, normalize to `[0,1]`
         video_tensor = torch.from_numpy(np.array(frames)).permute(0, 3, 1, 2).float() / 255.0
         
         return video_tensor
@@ -122,10 +123,10 @@ def get_video_frame_count(video_path: str) -> int:
 
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     """
-    Convert tensor [C, H, W] to PIL Image.
+    Convert tensor `[C, H, W]` to PIL Image.
     
     Args:
-        tensor: Input tensor in format [C, H, W]
+        tensor: Input tensor in format `[C=3, H, W]`，值域可以是 `[0,1]` 或 `[0,255]`
         
     Returns:
         PIL Image in RGB mode
@@ -157,7 +158,7 @@ def apply_image_augmentation(frame: np.ndarray,
         flip_prob: Probability of applying horizontal flip
         
     Returns:
-        Augmented image [H, W, C]
+        Augmented image `[H, W, C]`，空间维和通道数不变
     """
     # Random brightness adjustment
     if random.random() < brightness_prob:

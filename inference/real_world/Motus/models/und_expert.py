@@ -31,7 +31,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UndExpertConfig:
-    """Configuration for Understanding Expert model."""
+    """Understanding Expert 配置。
+
+    维度约定:
+    - `B`: batch size
+    - `L_vlm`: VLM 文本+图像 token 序列长度
+    - `D_vlm`: VLM hidden size，默认配置常见为 2048
+    - `D_und`: Understanding Expert hidden size，即 `dim`
+    - `D_wan`: WAN hidden size，用于三模态 joint attention 的共享 head space
+    """
     # Architecture - same naming as ActionExpert for consistency
     dim: int = 512                   # Hidden dimension for understanding expert
     ffn_dim: int = 2048              # FFN dimension (computed from dim * multiplier)
@@ -73,6 +81,8 @@ class UndExpertBlock(nn.Module):
     Understanding Expert Block - almost identical to ActionExpertBlock.
     
     Only provides projections for trimodal joint attention with WAN, no registers.
+    输入 `und_tokens` 的形状为 `[B, L_vlm, D_und]`；在 joint attention 中会投影到
+    WAN 的多头空间 `[B, L_vlm, num_heads, head_dim]`，输出再映射回 `[B, L_vlm, D_und]`。
     """
     
     def __init__(self, config: UndExpertConfig, wan_config: dict):
@@ -114,6 +124,11 @@ class UndExpert(nn.Module):
     - No registers
     - Configurable FFN ratio
     - No decoder
+
+    推理中由 `UndModule.extract_und_features` 调用:
+    - VLM last hidden states: `[B, L_vlm, D_vlm]`
+    - `vlm_adapter`: `[B, L_vlm, D_vlm] -> [B, L_vlm, D_und]`
+    - 每层 FFN/joint attention 都保持 `[B, L_vlm, D_und]`
     """
     
     def __init__(self, config: UndExpertConfig, wan_config: dict = None, vlm_config: dict = None):
@@ -141,7 +156,10 @@ class UndExpert(nn.Module):
             ])
     
     def build_condition_adapter(self, projector_type, in_features, out_features):
-        """Build condition adapter - same as ActionExpert implementation."""
+        """构建 VLM 到 Understanding hidden space 的适配器。
+
+        典型形状: `[B, L_vlm, in_features=D_vlm] -> [B, L_vlm, out_features=D_und]`。
+        """
         projector = None
         if projector_type == 'linear':
             projector = nn.Linear(in_features, out_features)

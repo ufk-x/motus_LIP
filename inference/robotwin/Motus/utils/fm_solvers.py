@@ -22,6 +22,12 @@ if is_scipy_available():
 
 
 def get_sampling_sigmas(sampling_steps, shift):
+    """生成 flow-matching 采样噪声表。
+
+    Returns:
+        `sigma`: numpy array `[sampling_steps]`，从接近 1 递减到接近 0；
+        `shift` 会改变中间步长分布，但不改变返回维度。
+    """
     sigma = np.linspace(1, 0, sampling_steps + 1)[:sampling_steps]
     sigma = (shift * sigma / (1 + (shift - 1) * sigma))
 
@@ -36,6 +42,13 @@ def retrieve_timesteps(
     sigmas=None,
     **kwargs,
 ):
+    """设置 scheduler timesteps，并返回实际使用的时间步。
+
+    维度/长度:
+    - `timesteps`: 若传入，长度为 `S`
+    - `sigmas`: 若传入，长度为 `S`
+    - 返回 `scheduler.timesteps`，形状通常为 `[S]`，`num_inference_steps=S`
+    """
     if timesteps is not None and sigmas is not None:
         raise ValueError(
             "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
@@ -274,9 +287,9 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         sigmas = np.concatenate([sigmas, [sigma_last]
                                 ]).astype(np.float32)  # pyright: ignore
 
-        self.sigmas = torch.from_numpy(sigmas)
+        self.sigmas = torch.from_numpy(sigmas)  # [S+1]，最后一个为 sigma_last
         self.timesteps = torch.from_numpy(timesteps).to(
-            device=device, dtype=torch.int64)
+            device=device, dtype=torch.int64)  # [S]
 
         self.num_inference_steps = len(timesteps)
 
@@ -719,11 +732,12 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         the multistep DPMSolver.
         Args:
             model_output (`torch.Tensor`):
-                The direct output from learned diffusion model.
+                The direct output from learned diffusion model. 形状必须与 `sample` 一致，
+                Motus 中 video 为 `[B,48,T,H,W]`，action 为 `[B,A,action_dim]`。
             timestep (`int`):
                 The current discrete timestep in the diffusion chain.
             sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
+                A current instance of a sample created by the diffusion process，形状同 `model_output`。
             generator (`torch.Generator`, *optional*):
                 A random number generator.
             variance_noise (`torch.Tensor`):
@@ -733,8 +747,7 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 Whether or not to return a [`~schedulers.scheduling_utils.SchedulerOutput`] or `tuple`.
         Returns:
             [`~schedulers.scheduling_utils.SchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_utils.SchedulerOutput`] is returned, otherwise a
-                tuple is returned where the first element is the sample tensor.
+                返回的 `prev_sample` 与 `sample` 同形状；若 `return_dict=False`，返回 `(prev_sample,)`。
         """
         if self.num_inference_steps is None:
             raise ValueError(

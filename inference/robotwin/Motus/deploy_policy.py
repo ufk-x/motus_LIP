@@ -37,6 +37,15 @@ class MotusPolicy:
     """
     Motus Policy wrapper for RoboTwin evaluation.
     Implements the joint video-action diffusion model for robotic control.
+
+    推理数据流总览:
+    - RoboTwin RGB 观测先整理为单帧图像 `[H,W,C=3]`，再转为 Motus 条件帧 `[B=1,C=3,H,W]`
+    - 机器人关节状态从 `[state_dim]` 变为 `[B=1,state_dim]`
+    - T5 文本条件传给 WAN: `List[Tensor[L_t5,D_t5]]`
+    - Qwen3-VL processor 输出传给 Understanding Expert: `input_ids [1,L]`,
+      `attention_mask [1,L]`, `image_grid_thw [N_image,3]`
+    - Motus 输出动作 `[1, action_chunk_size, action_dim]`，返回给环境前 squeeze 为
+      `[action_chunk_size, action_dim]`
     """
     
     def __init__(self, checkpoint_path: str, config_path: str, wan_path: str, vlm_path: str, device: str = "cuda", log_dir: Optional[str] = None, task_name: Optional[str] = None):
@@ -64,7 +73,9 @@ class MotusPolicy:
         # Initialize VLM processor from vlm_path (for tokenization only, weights from checkpoint)
         self.vlm_processor = AutoProcessor.from_pretrained(self.vlm_path, trust_remote_code=True)
         
-        # Initialize observation cache
+        # Initialize observation cache.
+        # obs_cache 只保留最近一帧条件图像: each tensor `[1,3,H,W]`。
+        # action_cache 保存最近一次模型预测出的动作序列: each action `[action_dim]`。
         self.obs_cache = deque(maxlen=1)
         self.action_cache = deque()
         
@@ -172,7 +183,12 @@ class MotusPolicy:
     
     def update_obs(self, observation: Dict[str, Any]):
         """Update observation cache with new observation."""
-        # Extract visual observations
+        # Extract visual observations.
+        # RoboTwin 三相机输入常见为:
+        # - head_img: `[H_head, W_head, 3]`
+        # - left/right: `[H_arm, W_arm, 3]`
+        # 这里将左右臂图 resize 到 `[120,160,3]`，横向拼成 bottom_row `[120,320,3]`，
+        # 再与 head_img 纵向拼接为单张条件图 `[H_head+120, 320, 3]`。
         if 'observation' in observation:
             obs_data = observation['observation']
             if 'head_camera' in obs_data and 'left_camera' in obs_data and 'right_camera' in obs_data:
@@ -180,10 +196,10 @@ class MotusPolicy:
                 left_img = obs_data['left_camera']['rgb']
                 right_img = obs_data['right_camera']['rgb']
                 
-                left_img_resized = cv2.resize(left_img, (160, 120))
-                right_img_resized = cv2.resize(right_img, (160, 120))
-                bottom_row = np.concatenate([left_img_resized, right_img_resized], axis=1)
-                image = np.concatenate([head_img, bottom_row], axis=0)
+                left_img_resized = cv2.resize(left_img, (160, 120))   # [120,160,3]
+                right_img_resized = cv2.resize(right_img, (160, 120)) # [120,160,3]
+                bottom_row = np.concatenate([left_img_resized, right_img_resized], axis=1)  # [120,320,3]
+                image = np.concatenate([head_img, bottom_row], axis=0)  # [H_head+120,320,3]
             else:
                 raise ValueError("Missing camera data")
         elif 'head_camera' in observation:
@@ -197,29 +213,29 @@ class MotusPolicy:
                       self.config_dict['common']['video_width'])
 
         if isinstance(image, np.ndarray):
-            image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+            image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)  # [H,W,C] -> [1,C,H,W]
         else:
             image_tensor = image
 
         if image_tensor.shape[-2:] != target_size:
-            image_np = image_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            resized_np = resize_with_padding(image_np, target_size)
+            image_np = image_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()  # [1,C,H,W] -> [H,W,C]
+            resized_np = resize_with_padding(image_np, target_size)  # [target_H,target_W,C]
             if resized_np.dtype == np.uint8:
                 resized_np = resized_np.astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(resized_np).permute(2, 0, 1).unsqueeze(0)
+            image_tensor = torch.from_numpy(resized_np).permute(2, 0, 1).unsqueeze(0)  # [1,C,target_H,target_W]
         
         self.obs_cache.append(image_tensor.to(self.device))
 
         # Extract robot state
-        state = observation['joint_action']['vector']
+        state = observation['joint_action']['vector']  # [state_dim]
 
         if isinstance(state, np.ndarray):
-            state_tensor = torch.from_numpy(state).float().unsqueeze(0)
+            state_tensor = torch.from_numpy(state).float().unsqueeze(0)  # [state_dim] -> [1,state_dim]
         else:
             state_tensor = state.float().unsqueeze(0) if state.dim() == 1 else state.float()
 
         self.current_state = state_tensor.to(self.device)
-        self.current_state_norm = self._normalize_actions(self.current_state).to(self.device)
+        self.current_state_norm = self._normalize_actions(self.current_state).to(self.device)  # [1,state_dim], [0,1]
     
     def get_action(self, instruction: str = None) -> List[np.ndarray]:
         """Get action predictions from the model."""
@@ -245,6 +261,7 @@ class MotusPolicy:
             raise ValueError("Unexpected T5 encoder output format")
 
         # Build VLM inputs
+        # current_frame `[1,3,H,W]` -> PIL RGB，用于 VLM processor；WAN 分支仍直接使用 tensor。
         first_frame_pil = self._tensor_to_pil_image(current_frame.squeeze(0).cpu())
         vlm_inputs = self._preprocess_vlm_messages(instruction, first_frame_pil)
 
@@ -252,11 +269,11 @@ class MotusPolicy:
         num_inference_steps = self.config_dict['model']['inference']['num_inference_timesteps']
         with torch.no_grad():
             predicted_frames, predicted_actions = self.model.inference_step(
-                first_frame=current_frame,
-                state=self.current_state,
+                first_frame=current_frame,  # [1,3,H,W]
+                state=self.current_state,   # [1,state_dim]
                 num_inference_steps=num_inference_steps,
-                language_embeddings=t5_list,
-                vlm_inputs=[vlm_inputs],
+                language_embeddings=t5_list,  # List[Tensor[L_t5,D_t5]]
+                vlm_inputs=[vlm_inputs],      # List[Dict[str,Tensor]], batch size=1
             )
 
         # Save frame grid
@@ -273,7 +290,7 @@ class MotusPolicy:
                 self._save_frame_grid(condition_frame_viz, predicted_frames_viz)
                 self.step_count += 1
 
-        actions_real = predicted_actions.squeeze(0).cpu().numpy()
+        actions_real = predicted_actions.squeeze(0).cpu().numpy()  # [1,A,action_dim] -> [A,action_dim]
         self.prev_action = actions_real[-1].copy()
         self.action_cache.extend(actions_real)
 
@@ -288,7 +305,14 @@ class MotusPolicy:
         return Image.fromarray(np_img, mode='RGB')
 
     def _preprocess_vlm_messages(self, instruction: str, image: Image.Image) -> Dict[str, torch.Tensor]:
-        """Build VLM inputs."""
+        """Build VLM inputs.
+
+        返回字段常见维度:
+        - `input_ids`: `[1, L_text_image]`
+        - `attention_mask`: `[1, L_text_image]`
+        - `pixel_values`: processor 定义的视觉 patch 张量
+        - `image_grid_thw`: `[N_image, 3]`，每行对应 `(T,H,W)` 网格
+        """
         messages = [
             {
                 'role': 'user',
@@ -301,8 +325,8 @@ class MotusPolicy:
         text = self.vlm_processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
         encoded = self.vlm_processor(text=[text], images=[image], return_tensors='pt')
         vlm_inputs = {
-            'input_ids': encoded['input_ids'].to(self.device),
-            'attention_mask': encoded['attention_mask'].to(self.device), 
+            'input_ids': encoded['input_ids'].to(self.device),          # [1,L]
+            'attention_mask': encoded['attention_mask'].to(self.device), # [1,L]
             'pixel_values': encoded['pixel_values'].to(self.device),
             'image_grid_thw': encoded.get('image_grid_thw', None)
         }

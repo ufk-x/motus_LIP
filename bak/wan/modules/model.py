@@ -21,7 +21,7 @@ def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x
+    return x # 一个position对应一个dim维的sinusoidal embedding
 
 
 @torch.amp.autocast('cuda', enabled=False)
@@ -175,7 +175,7 @@ class WanSelfAttention(nn.Module):
                 und_v: torch.Tensor = None):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            x(Tensor): Shape [B, L, num_heads, C / num_heads], 输入的x应该是[B, L_v, 3072]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
@@ -186,19 +186,27 @@ class WanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).view(b, s, n, d) # [B, L_v, 3072]->[B, L_v, 3072]->[B, L_v, 3072]->[B, L_v, num_heads=24, head_dim=128]
+            k = self.norm_k(self.k(x)).view(b, s, n, d) # 同上
+            v = self.v(x).view(b, s, n, d) # 没有经过RMSNorm，直接线性投影后reshape成多头格式 [B, L_v, 3072]->[B, L_v, 3072]->[B, L_v, num_heads=24, head_dim=128]
             return q, k, v
 
         q, k, v = qkv_fn(x)
 
         # Trimodal MoT branch: WAN + Action + Understanding
         if action_q is not None or und_q is not None:
-            L_x = q.size(1)
+            L_x = q.size(1) # Video tokens 的长度，WAN self-attn 的主操作对象
             
             # Apply RoPE only to video tokens (q, k)
-            q_video_rope = rope_apply(q, grid_sizes, freqs)
+            # 只给 video 的 q/k 加 3D RoPE,因为 video token 有明确的 3D patch 网格
+            # 输入：
+            # q, k        : [B, L_v, 24, 128]
+            # grid_sizes  : [B, 3]
+            # freqs       : [1024, 64]
+            # 输出：
+            # q_video_rope : [B, L_v, 24, 128]
+            # k_video_rope : [B, L_v, 24, 128]
+            q_video_rope = rope_apply(q, grid_sizes, freqs) # 
             k_video_rope = rope_apply(k, grid_sizes, freqs)
             
             # Prepare parts for concatenation
@@ -225,40 +233,45 @@ class WanSelfAttention(nn.Module):
                 L_und = 0
             
             # Concatenate all modalities
-            q_cat = torch.cat(q_parts, dim=1)
-            k_cat = torch.cat(k_parts, dim=1)
-            v_cat = torch.cat(v_parts, dim=1)
+            q_cat = torch.cat(q_parts, dim=1) # [ B, L_v + L_a + L_u, 24, 128]
+            k_cat = torch.cat(k_parts, dim=1) # 同上
+            v_cat = torch.cat(v_parts, dim=1) # 同上
 
             attn_out = flash_attention(
                 q=q_cat,
                 k=k_cat,
                 v=v_cat,
-                k_lens=seq_lens,
-                window_size=self.window_size)
+                k_lens=seq_lens, # [B,] 每个元素是视频+动作+理解的总长度
+                window_size=self.window_size) 
+            # window_size 在 WAN 配置里是一个二元组，分别对应空间和时间维度的局部注意力窗口大小，默认是全局注意力 (-1, -1)
 
             # Split outputs back to respective modalities
-            x_out = attn_out[:, :L_x, :, :]
+            x_out = attn_out[:, :L_x, :, :] # [B, L_v, 24, 128]
             outputs = [x_out]
             
             start_idx = L_x
             if action_q is not None:
-                action_out = attn_out[:, start_idx:start_idx+L_action, :, :]
+                action_out = attn_out[:, start_idx:start_idx+L_action, :, :] # [ B, L_a, 24, 128]
                 outputs.append(action_out)
                 start_idx += L_action
             else:
                 outputs.append(None)
                 
             if und_q is not None:
-                und_out = attn_out[:, start_idx:start_idx+L_und, :, :]
+                und_out = attn_out[:, start_idx:start_idx+L_und, :, :] # [B, L_u, 24, 128]
                 outputs.append(und_out)
             else:
                 outputs.append(None)
 
             # Project WAN branch; other branches returned in head shape for external projection
-            x_out = x_out.flatten(2)
-            x_out = self.o(x_out)
+            x_out = x_out.flatten(2) # [B, L_v, 24*128=3072]
+            x_out = self.o(x_out) # [B, L_v, 3072] -> [B, L_v, 3072]
             outputs[0] = x_out
-            
+
+            # 返回的是;
+            # y            : [B, L_v, 3072]
+            # action_out_h : [B, L_a, 24, 128]
+            # und_out_h    : [B, L_u, 24, 128]
             return tuple(outputs)
 
         # Standard branch (no MoT)

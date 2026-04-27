@@ -1132,10 +1132,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
+                # input_ids shape [seq_len], attention_mask shape [B, seq_len]
                 if attention_mask is not None:
-                    input_ids = input_ids[attention_mask[i]]
+                    input_ids = input_ids[attention_mask[i]] # 只取len维度下不是padding的部分计算position_ids, shape:[real_seq_len]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1) # [num_vision_start_tokens]
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
                 video_nums = (vision_tokens == video_token_id).sum()
@@ -1265,11 +1266,23 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 The tensors corresponding to the input images.
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
+            image_grid_thw 是 每个图片的 patch 规格，shape是 (num_images, 3)，其中3分别对应 temporal, height 和 width。
+            在self.visual编码图片时，视觉编码器会根据这个规格将每个图片划分成多个 patch，并为每spatial_merge_size**2个 patch 生成一个特征向量。
+            所以得到的image_embeds的第2维是所有图片的特征数量之和，即 sum(image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)。
+            接下来通过torch.split将这些特征按照每个图片的特征数量进行分割，
+            每个图片分得的特征数目就是对应的patch数量/spatial_merge_size**2。
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # 所有图片的特征连在了一起
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw) # shape (B, num_patches, embed_dim)
+
+        # image_grid_thw shape (B=num_images, 3)，每个图像的 temporal, height 和 width。
+        # image_grid_thw.prod(-1) 计算每个图像的 patch 数量，除以 spatial_merge_size**2 是因为视觉编码器可能会将多个 patch 合并成一个特征。
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
+        
+        # image_embeds shape (B, sum(split_sizes), embed_dim)，每个split对应一个图像的特征，split size shape (B, num_patches_per_image, embed_dim)
+        image_embeds = torch.split(image_embeds, split_sizes) 
         return image_embeds
 
     def get_placeholder_mask(
@@ -1284,13 +1297,18 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         equal to the length of multimodal features. If the lengths are different, an error is raised.
         """
         if input_ids is None:
+            # 假如input_ids是None，我们就通过inputs_embeds来找到特殊的image和video token的位置。我们先获取image_token_id和video_token_id对应的embedding向量，
+            # 然后在inputs_embeds中找到和这些embedding向量相等的位置，这些位置就是特殊的image和video token的位置。最后我们将这些位置扩展成和inputs_embeds一样的形状，以便后续使用。
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
                 torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
-            )
+            ) # shape (batch_size, seq_len, embed_dim)
+            # all函数作用是判断在最后一个维度上是否所有的元素都满足条件（即都相等），如果是则返回True，否则返回False。这样我们就得到了一个布尔型的mask，表示哪些位置是特殊的image token。同样的方法也适用于video token。
+            # 因为embedding向量是多维的，所以我们需要在最后一个维度上进行all操作，只有当所有维度都相等时才认为找到了特殊token的位置。
             special_image_mask = special_image_mask.all(-1)
             special_video_mask = inputs_embeds == self.get_input_embeddings()(
                 torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
             )
+            # all函数逻辑：对于每个位置，如果inputs_embeds在所有维度上都等于对应的特殊token的embedding，那么special_image_mask在该位置就为True，否则为False。这样我们就得到了一个布尔型的mask，表示哪些位置是特殊的image token。同样的方法也适用于video token。
             special_video_mask = special_video_mask.all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id

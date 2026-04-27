@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Encode a single text instruction to T5 embeddings for WAN model.
+
+输出维度说明:
+- tokenizer 首先产生 `ids [B=1, text_len]` 和 `mask [B=1, text_len]`
+- T5 encoder 输出 `context [B=1, text_len, D_t5]`
+- 脚本按有效 token 数裁剪 padding，保存为 `[L_t5, D_t5]`
+
 Usage:
     python encode_t5_instruction.py --instruction "pick up the cube" --output t5_embed.pt --wan_path /path/to/wan
 """
@@ -64,14 +70,16 @@ def main():
         tokenizer_path=os.path.join(args.wan_path, 'Wan2.2-TI2V-5B', 'google/umt5-xxl'),
     )
     
-    # Encode instruction
+    # Encode instruction.
+    # encoded 通常是 List[Tensor]，长度等于文本条数；单条指令时为
+    # `[Tensor[L_t5, D_t5]]`，其中 `L_t5 <= text_len`。
     print(f"Encoding instruction: '{args.instruction}'")
     encoded = encoder([args.instruction], args.device)
     
     # Handle output format (list of tensors)
     if isinstance(encoded, list):
         if len(encoded) == 1:
-            # Single instruction -> save as single tensor
+            # Single instruction -> save as single tensor [L_t5, D_t5]
             embedding = encoded[0]
         else:
             # Multiple instructions -> save as list
