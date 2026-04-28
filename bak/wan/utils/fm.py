@@ -35,6 +35,7 @@ class FlowMatchScheduler():
             self.shift = shift
         sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength  # 0 + (1- 0) * 1 = 1
         if self.extra_one_step:
+            # sigmas,从1到0，从噪声到干净
             self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
         else:
             self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps)
@@ -44,6 +45,8 @@ class FlowMatchScheduler():
             mu = self.calculate_shift(dynamic_shift_len) if dynamic_shift_len is not None else self.exponential_shift_mu
             self.sigmas = math.exp(mu) / (math.exp(mu) + (1 / self.sigmas - 1))
         else:
+            # sigmas = 5 * sigmas // (1 + (5-1)*sigmas)
+            # sigmas = 5*x/(1+4*x),x从1到0，sigmas也是从1到0，但在x较大时（接近1）sigmas会被放大，在x较小时（接近0）sigmas会被压缩，这样可以让训练过程在前期更关注高噪声水平的样本，在后期更关注低噪声水平的样本，从而提升模型的训练效果。
             self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
         if self.shift_terminal is not None:
             one_minus_z = 1 - self.sigmas
@@ -51,6 +54,7 @@ class FlowMatchScheduler():
             self.sigmas = 1 - (one_minus_z / scale_factor)
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
+        # timesteps = 1000*sigmas = 1000 * 5*x/(1+4*x)
         self.timesteps = self.sigmas * self.num_train_timesteps
         if training:
             x = self.timesteps

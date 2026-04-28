@@ -559,12 +559,21 @@ class ActionModule(nn.Module):
             t_flat = t.flatten()  # [B * L_a]
             
             # Create sinusoidal embedding (same pattern as VideoModule)
+            #     self.time_embedding = nn.Sequential(
+            #     nn.Linear(self.freq_dim, config.dim),
+            #     nn.SiLU(),
+            #     nn.Linear(config.dim, config.dim)
+            # )
             a_e = self.action_expert.time_embedding(
-                sinusoidal_embedding_1d(self.action_expert.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float()
-            )  # [B, seq_len, freq_dim]
+                sinusoidal_embedding_1d(self.action_expert.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float() # 把第0维unflatten成两个维度相乘，shape[0] = bt*seq_len
+            )  # [B, L_a, freq_dim] -> [B, L_a, D_action_hidden], config.action_expert_dim通常为1024,freq_dim通常为256
             
             # Project to AdaLN parameters (6 params: 3 for WAN-Action joint attn + 3 for FFN)
-            a_e0 = self.action_expert.time_projection(a_e).unflatten(2, (6, self.config.action_expert_dim))  # [B, L_a, 6, D_action_hidden]
+            # self.time_projection = nn.Sequential(
+            #     nn.SiLU(),
+            #     nn.Linear(config.dim, config.dim * 6)  # 6 parameters: 3 for WAN-Action joint attn + 3 for FFN
+            # )
+            a_e0 = self.action_expert.time_projection(a_e).unflatten(2, (6, self.config.action_expert_dim))  # [B, L_a, D_action_hidden] =proj=> [B, L_a, 6*D_action_hidden] =unflatten=> [B, L_a, 6, D_action_hidden]
             
             assert a_e.dtype == torch.float32 and a_e0.dtype == torch.float32
 
@@ -579,9 +588,9 @@ class ActionModule(nn.Module):
         action_layer = self.action_expert.blocks[layer_idx]
         with torch.amp.autocast('cuda', dtype=torch.float32):
             modulation = (
-                action_layer.modulation.unsqueeze(0)
-                + action_adaln_params
-            ).chunk(6, dim=2)
+                action_layer.modulation.unsqueeze(0) # [1, 6, 1024] -> [1, 1, 6, 1024],以适配[B, L_a, 6, D_action_hidden]
+                + action_adaln_params # [B, L_a, 6, D_action_hidden]
+            ).chunk(6, dim=2) # 切成6份，每份对应一个AdaLN参数，得到长度为6的tuple，每个元素形状都是[B, L_a, 1, D_action_hidden]
         return modulation
 
     def process_ffn(self, action_tokens: torch.Tensor, action_adaln_modulation: tuple, layer_idx: int) -> torch.Tensor:
@@ -739,6 +748,7 @@ class Motus(nn.Module):
         self.action_expert.time_projection.to(dtype=torch.float32)
 
         # Pre-compute grid_sizes for training batch size
+        # VAE的压缩率是(4,16,16)，WAN的patch_size是(1,2,2)，所以总的压缩率是(4,32,32)，latent的T,H,W分别是视频的T,H,W除以压缩率
         lat_T = 1 + config.num_video_frames // 4
         lat_H = config.video_height // 32
         lat_W = config.video_width // 32
@@ -891,7 +901,7 @@ class Motus(nn.Module):
         B = video_frames.shape[0]  # batch size
 
         # 1. Video pipeline
-        # Normalize/format
+        # Normalize/format,从[0, 1]映射到[-1, 1]
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)  # [B, C, 1, H, W]
         video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)  # [B, C, T_video, H, W]
         full_video = torch.cat([first_frame_norm, video_normalized], dim=2)  # [B, C, 1+T_video, H, W]
@@ -901,19 +911,23 @@ class Motus(nn.Module):
             clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))  # [B, C_latent, T_latent, H_latent, W_latent]
             condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))  # [B, C_latent, 1, H_latent, W_latent]
 
-        # Flow-Matching noise mixture
+        # Flow-Matching noise mixture,B个均匀分布的随机整数标量，范围是[0, num_train_timesteps)，num_train_timesteps通常是1000
         timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))  # [B]
         # Scalar timesteps (0..num_train_timesteps) for time embedding
+        # video_t_embed和timestep_id不同在于video_t_embed是经过scheduler的timesteps映射后的值，通常是一个连续的值，而timestep_id是离散的整数索引
         video_t_embed = self.fm_train_scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)  # [B]
         # Sigma for noise mixture
+        # sigma和video_t_embed是一一对应的，都是根据timestep_id从scheduler中取出的值。video_t_embed用于时间嵌入，而sigma用于控制视频latent和噪声的混合比例。随着timestep_id增加，通常video_t_embed会增加（具体取决于scheduler的设计），而sigma也会相应调整，使得训练过程中模型逐渐适应更高噪声水平的视频输入。
         sigma = self.fm_train_scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device).view(B, 1, 1, 1, 1)  # [B,1,1,1,1]
         video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)  # [B, C_latent, T_latent, H_latent, W_latent]
+        # sigma=0时完全是clean_full_latent，sigma=1时完全是video_noise，中间值则是两者的线性混合
         noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma  # [B, C_latent, T_latent, H_latent, W_latent]
-        # Teacher Forcing on the first frame
+        # Teacher Forcing on the first frame，只在[B, C_latent, T_latent，H_latent, W_latent]的T维度的第0帧位置强制使用condition_frame_latent，确保模型在训练时始终以第一帧的真实信息作为条件输入
         noisy_video_latent[:, :, 0:1] = condition_frame_latent
         # Flow-Matching target: noise - clean
+        # noisy_video_latent对sigma求导
         video_target = video_noise - clean_full_latent  # [B, C_latent, T_latent, H_latent, W_latent]
-        video_target[:, :, 0:1] = 0
+        video_target[:, :, 0:1] = 0 # 因为第一帧没有噪声，所以对应的target应该是0
 
         # Latent to Tokens
         video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))  # [B, L_v, D_wan]
@@ -980,12 +994,12 @@ class Motus(nn.Module):
             # Slice predicted actions depending on mode
             if self.config.training_mode == 'pretrain':
                 action_pred = action_pred_full[:, :up_len, :]  # [B, L_a, D_action_raw]
-            else:
+            else: # 刨除index为0的状态token
                 action_pred = action_pred_full[:, 1:up_len, :]  # [B, L_a, D_action_raw]
 
             # Video loss (mask the first frame)
             video_pred_masked = video_pred.clone()  # [B, C_latent, T_latent, H_latent, W_latent]
-            video_pred_masked[:, :, 0:1] = 0
+            video_pred_masked[:, :, 0:1] = 0 # 把video_pred的第一帧置零，和video_target的第一帧一致，确保损失计算时第一帧不贡献误差
             video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
         
             # Action loss
@@ -1029,6 +1043,7 @@ class Motus(nn.Module):
         """
         B = first_frame.shape[0]  # batch size，真实世界示例通常为 1
 
+        # device和dtype consistency: 确保所有输入都在正确的设备和数据类型上，避免运行时错误
         language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]  # List[[L_t5_i, D_t5]]
         state = state.to(self.device).to(self.dtype)          # [B, state_dim]
         first_frame = first_frame.to(self.device).to(self.dtype)  # [B, 3, H, W]
@@ -1124,6 +1139,7 @@ class Motus(nn.Module):
                     und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
 
                 # Heads (velocities)
+                # 从token空间到latent空间的解码，得到视频和动作的velocity
                 video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)  # [B, C_latent, T_latent, H_latent, W_latent]
                 # Use decoder with all tokens (including registers)
                 action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)  # [B, 1+L_a+num_registers, D_action_raw]
@@ -1139,11 +1155,12 @@ class Motus(nn.Module):
 
         # 4. Decode outputs
         with torch.no_grad():
+            # 从latent空间到像素空间的解码，得到预测的视频帧
             decoded_frames = self.video_model.decode_video(video_latent)  # 通常为 [B, 3, 1+T_video, H, W]
             predicted_frames = decoded_frames[:, :, 1:]  # [B, 3, T_video, H, W]，去掉条件帧
             predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] -> [0,1]
             predicted_frames = torch.clamp(predicted_frames, 0, 1).float()  # [B, 3, T_video, H, W]
-        
+        # action latent空间和action实际空间一样，所以直接输出即可
         predicted_actions = action_latent.float()  # [B, action_chunk_size, action_dim]
 
         return predicted_frames, predicted_actions
